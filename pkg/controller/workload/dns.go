@@ -10,15 +10,14 @@ import (
 	"kmesh.net/kmesh/api/v2/workloadapi"
 	"kmesh.net/kmesh/pkg/controller/workload/cache"
 	"kmesh.net/kmesh/pkg/dns"
-	// "kmesh.net/kmesh/pkg/logger"
 )
 
 type dnsController struct {
-	servicesChan chan []*workloadapi.Service
-	cache        cache.ServiceCache
-	dnsResolver  *dns.DNSResolver
+	workloadsChan chan []*workloadapi.Workload
+	cache         cache.WorkloadCache
+	dnsResolver   *dns.DNSResolver
 	// store the copy of pendingResolveWorkload.
-	serviceCache map[string]*pendingResolveDomain
+	workloadCache map[string]*pendingResolveDomain
 	// store all pending hostnames in the workloads
 	pendingHostnames map[string][]string
 	sync.RWMutex
@@ -27,20 +26,20 @@ type dnsController struct {
 // pending resolve domain info of Dual-Engine Mode,
 // workload is used for create the apiworkload
 type pendingResolveDomain struct {
-	Services    []*workloadapi.Service
+	Workloads   []*workloadapi.Workload
 	RefreshRate time.Duration
 }
 
-func NewDnsController(serviceCache cache.ServiceCache) (*dnsController, error) {
+func NewDnsController(cache cache.WorkloadCache) (*dnsController, error) {
 	resolver, err := dns.NewDNSResolver()
 	if err != nil {
 		return nil, err
 	}
 	return &dnsController{
-		servicesChan:     make(chan []*workloadapi.Service),
-		cache:            serviceCache,
+		workloadsChan:    make(chan []*workloadapi.Workload),
+		cache:            cache,
 		dnsResolver:      resolver,
-		serviceCache:     make(map[string]*pendingResolveDomain),
+		workloadCache:    make(map[string]*pendingResolveDomain),
 		pendingHostnames: make(map[string][]string),
 	}, nil
 }
@@ -48,27 +47,31 @@ func NewDnsController(serviceCache cache.ServiceCache) (*dnsController, error) {
 func (r *dnsController) Run(stopCh <-chan struct{}) {
 	go r.dnsResolver.StartDnsResolver(stopCh)
 	go r.refreshWorker(stopCh)
-	go r.processServices()
+	go r.processWorkloads()
 	go func() {
 		<-stopCh
-		close(r.servicesChan)
+		close(r.workloadsChan)
 	}()
 }
 
-func (r *dnsController) processServices() {
-	for services := range r.servicesChan {
-		r.processDomains(services)
+func (r *dnsController) processWorkloads() {
+	for workloads := range r.workloadsChan {
+		r.processDomains(workloads)
 	}
 }
 
-func (r *dnsController) processDomains(services []*workloadapi.Service) {
-	domains := getPendingResolveDomain(services)
+func (r *dnsController) processDomains(workload []*workloadapi.Workload) {
+	domains := getPendingResolveDomain(workload)
 
 	// store all pending hostnames of clusters in pendingHostnames
-	for _, service := range services {
-		serviceName := service.GetName()
-		info := []string{service.GetHostname()}
-		r.pendingHostnames[serviceName] = info
+	for _, workload := range workload {
+		workloadName := workload.GetName()
+		hostname := workload.GetHostname()
+		r.pendingHostnames[workloadName] = []string{hostname}
+		r.workloadCache[hostname] = &pendingResolveDomain{
+			Workloads:   []*workloadapi.Workload{workload},
+			RefreshRate: 15 * time.Second,
+		}
 	}
 
 	// delete any scheduled re-resolve for domains we no longer care about
@@ -78,8 +81,10 @@ func (r *dnsController) processDomains(services []*workloadapi.Service) {
 	for k, v := range domains {
 		addresses := r.dnsResolver.GetDNSAddresses(k)
 		if addresses != nil {
-			go r.updateServices(v.(*pendingResolveDomain), k, addresses)
+			go r.updateWorkloads(v.(*pendingResolveDomain), k, addresses)
 		} else {
+			// Initialize the newly added hostname
+			// and add it to the dns queue to be resolved.
 			domainInfo := &dns.DomainInfo{
 				Domain:      k,
 				RefreshRate: v.(*pendingResolveDomain).RefreshRate,
@@ -95,41 +100,50 @@ func (r *dnsController) refreshWorker(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case domain := <-r.dnsResolver.DnsChan:
-			pendingDomain := r.getServicesByDomain(domain)
+			pendingDomain := r.getWorkloadsByDomain(domain)
+			// log.Infof("dnsController refreshWorker: domain %s, pendingDomain %v", domain, pendingDomain)
 			addrs := r.dnsResolver.GetDNSAddresses(domain)
-			r.updateServices(pendingDomain, domain, addrs)
+			maxRetry := 3
+			for range maxRetry {
+				if len(addrs) > 0 {
+					r.updateWorkloads(pendingDomain, domain, addrs)
+				}
+				time.Sleep(1 * time.Second)
+			}
 		}
 	}
 }
 
-func (r *dnsController) updateServices(pendingDomain *pendingResolveDomain, domain string, addrs []string) {
-	isServiceUpdate := false
-	if pendingDomain == nil || addrs == nil {
+func (r *dnsController) updateWorkloads(pendingDomain *pendingResolveDomain, domain string, addrs []string) {
+	isWorkerUpdate := false
+	if pendingDomain == nil || addrs == nil{
 		return
 	}
+	log.Infof("dnsController updateWorkloads: pendingDomain %v, domain %s, addrs %v", pendingDomain, domain, addrs)
 
-	for _, service := range pendingDomain.Services {
-		ready, newService := r.overwriteDnsService(service, domain, addrs)
-		if ready {
-			// 更新 workload 缓存和 BPF maps
-			if r.cache.GetService(service.ResourceName()) != nil {
-				r.cache.AddOrUpdateService(newService)
-				isServiceUpdate = true
+	for _, workload := range pendingDomain.Workloads {
+		if ready, newWorkload := r.overwriteDnsWorkload(workload, domain, addrs); ready {
+			// log.Infof("dnsController update cache for workload %s with addresses %v", workload.ResourceName(), addrs)
+			if r.cache.GetWorkloadByUid(workload.GetUid()) != nil {
+				r.cache.AddOrUpdateWorkload(newWorkload)
+				delete(r.workloadCache, domain)
+				isWorkerUpdate = true
 			}
 		}
 	}
 
-	if isServiceUpdate {
-		// w.cache.Flush() // 刷新到 BPF maps
+	if isWorkerUpdate {
+		// w.cache.Flush()
 	}
 }
 
-func (r *dnsController) overwriteDnsService(service *workloadapi.Service, domain string, addrs []string) (bool, *workloadapi.Service) {
+func (r *dnsController) overwriteDnsWorkload(workload *workloadapi.Workload, domain string, addrs []string) (bool, *workloadapi.Workload) {
 	ready := true
-	hostNames := r.pendingHostnames[service.GetName()]
+	hostNames := r.pendingHostnames[workload.GetName()]
 	addressesOfHostname := make(map[string][]string)
 
 	for _, hostName := range hostNames {
+		// log.Infof("overwriteDnsWorkload: checking hostname %s for workload %s with domain %s", hostName, workload.ResourceName(), domain)
 		addresses := r.dnsResolver.GetDNSAddresses(hostName)
 		// There are hostnames in this Cluster that are not resolved.
 		if addresses != nil {
@@ -140,64 +154,77 @@ func (r *dnsController) overwriteDnsService(service *workloadapi.Service, domain
 	}
 
 	if ready {
-		newService := cloneService(service)
+		// log.Infof("overwriteDnsWorkload ready for workload %s with domain %s", workload.ResourceName(), domain)
+		newWorkload := cloneWorkload(workload)
 		for _, addr := range addrs {
 			if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-				newService.Addresses = append(newService.Addresses, &workloadapi.NetworkAddress{
-					Address: netip.MustParseAddr(addr).AsSlice(),
-				})
+				newWorkload.Addresses = append(newWorkload.Addresses, netip.MustParseAddr(addr).AsSlice())
 			}
 		}
 
-		return ready, newService
+		return ready, newWorkload
 	}
 
 	return ready, nil
 }
 
-func getPendingResolveDomain(services []*workloadapi.Service) map[string]any {
+func getPendingResolveDomain(workloads []*workloadapi.Workload) map[string]any {
 	domains := make(map[string]any)
 
-	for _, service := range services {
-		hostname := service.GetHostname()
+	for _, workload := range workloads {
+		hostname := workload.GetHostname()
 		if hostname == "" {
 			continue
 		}
 
 		if _, err := netip.ParseAddr(hostname); err == nil {
+			// This is an ip address
 			continue
 		}
 
+		// log.Infof("getPendingResolveDomain: processing workload %s with hostname %s", workload.ResourceName(), hostname)
 		if v, ok := domains[hostname]; ok {
-			v.(*pendingResolveDomain).Services = append(v.(*pendingResolveDomain).Services, service)
+			v.(*pendingResolveDomain).Workloads = append(v.(*pendingResolveDomain).Workloads, workload)
 		} else {
 
-			domains[hostname] = &pendingResolveDomain{
-				Services:    []*workloadapi.Service{service},
+			domainWithRefreshRate := &pendingResolveDomain{
+				Workloads:   []*workloadapi.Workload{workload},
 				RefreshRate: 15 * time.Second,
 			}
+			domains[hostname] = domainWithRefreshRate
 		}
 	}
 
 	return domains
 }
 
-func (r *dnsController) getServicesByDomain(domain string) *pendingResolveDomain {
+func (r *dnsController) newWorkloadCache() {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.workloadCache != nil {
+		log.Debug("clean up dns workloads")
+		r.workloadCache = map[string]*pendingResolveDomain{}
+		return
+	}
+}
+
+func (r *dnsController) getWorkloadsByDomain(domain string) *pendingResolveDomain {
 	r.RLock()
 	defer r.RUnlock()
 
-	if r.cache != nil {
-		if v, ok := r.serviceCache[domain]; ok {
+	if r.workloadCache != nil {
+		if v, ok := r.workloadCache[domain]; ok {
 			return v
 		}
 	}
 	return nil
 }
 
-func cloneService(service *workloadapi.Service) *workloadapi.Service {
-	if service == nil {
+func cloneWorkload(workload *workloadapi.Workload) *workloadapi.Workload {
+	if workload == nil {
 		return nil
 	}
-	serviceCopy := proto.Clone(service).(*workloadapi.Service)
-	return serviceCopy
+	workloadCopy := proto.Clone(workload).(*workloadapi.Workload)
+	return workloadCopy
 }

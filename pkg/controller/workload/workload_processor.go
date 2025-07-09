@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	service_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/proto"
@@ -62,7 +63,7 @@ type Processor struct {
 	WaypointCache cache.WaypointCache
 	locality      bpf.LocalityCache
 
-	DnsResolverChan chan []*workloadapi.Service
+	DnsResolverChan chan []*workloadapi.Workload
 
 	once      sync.Once
 	authzOnce sync.Once
@@ -844,7 +845,6 @@ func (p *Processor) handleAddressTypeResponse(rsp *service_discovery_v3.DeltaDis
 		if err = anypb.UnmarshalTo(resource.Resource, address, proto.UnmarshalOptions{}); err != nil {
 			continue
 		}
-
 		switch address.GetType().(type) {
 		case *workloadapi.Address_Workload:
 			workloads = append(workloads, address.GetWorkload())
@@ -864,10 +864,6 @@ func (p *Processor) handleAddressTypeResponse(rsp *service_discovery_v3.DeltaDis
 
 // Mainly for the convenience of testing.
 func (p *Processor) handleServicesAndWorkloads(services []*workloadapi.Service, workloads []*workloadapi.Workload) {
-	if p.DnsResolverChan != nil {
-		p.DnsResolverChan <- services
-	}
-
 	var servicesToRefresh []*workloadapi.Service
 	for _, service := range services {
 		if err := p.handleService(service); err != nil {
@@ -888,11 +884,39 @@ func (p *Processor) handleServicesAndWorkloads(services []*workloadapi.Service, 
 
 	for _, workload := range workloads {
 		// TODO: Kmesh supports ServiceEntry
+		// log.Warnf("workload: %s/%s addresses: %v", workload.Namespace, workload.Name, workload.GetAddresses())
 		if workload.GetAddresses() == nil {
-			log.Warnf("workload: %s/%s addresses is nil", workload.Namespace, workload.Name)
-			continue
+			// Non-ServiceEntry workload with nil addresses will be ignored.
+			uid := workload.GetUid()
+			if !strings.Contains(uid, "ServiceEntry") {
+				log.Warnf("workload: %s/%s addresses is nil", workload.Namespace, workload.Name)
+				continue
+			} else {
+				log.Warnf("workload: %s/%s addresses is nil, workload info: %+v", workload.Namespace, workload.Name, workload)
+				// workload from service entry need address resolving
+				if p.DnsResolverChan != nil {
+					p.DnsResolverChan <- workloads
+				}
+				go func() {
+					maxRetries := 30
+					for range maxRetries {
+						workload := p.WorkloadCache.GetWorkloadByUid(uid)
+						address := workload.GetAddresses()
+						if address != nil {
+							log.Infof("workload: %s/%s addresses resolved: %v", workload.Namespace, workload.Name, address)
+							if err := p.handleWorkload(workload); err != nil {
+								log.Errorf("handle workload %s failed, err: %v", workload.ResourceName(), err)
+							}
+							break
+						} else {
+							log.Warnf("workload: %s/%s addresses is still nil, retrying...", workload.Namespace, workload.Name)
+						}
+						time.Sleep(1 * time.Second)
+					}
+				}()
+				// wait for the service entry to be resolved
+			}
 		}
-
 		if err := p.handleWorkload(workload); err != nil {
 			log.Errorf("handle workload %s failed, err: %v", workload.ResourceName(), err)
 		}

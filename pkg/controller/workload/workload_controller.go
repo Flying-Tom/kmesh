@@ -50,12 +50,12 @@ type Controller struct {
 
 func NewController(bpfWorkload *bpfwl.BpfWorkload, enableMonitoring, enablePerfMonitor bool) *Controller {
 	processor := NewProcessor(bpfWorkload.SockConn.KmeshCgroupSockWorkloadObjects.KmeshCgroupSockWorkloadMaps)
-	dnsResolverController, err := NewDnsController(processor.ServiceCache)
+	dnsResolverController, err := NewDnsController(processor.WorkloadCache)
 	if err != nil {
 		log.Errorf("dns resolver of Dual-Engine mode create failed: %v", err)
 		return nil
 	}
-	processor.DnsResolverChan = dnsResolverController.servicesChan
+	processor.DnsResolverChan = dnsResolverController.workloadsChan
 	c := &Controller{
 		dnsResolverController: dnsResolverController,
 		Processor:             processor,
@@ -151,6 +151,7 @@ func (c *Controller) HandleWorkloadStream() error {
 		return fmt.Errorf("stream recv failed, %s", err)
 	}
 
+	// c.dnsResolverController.newWorkloadCache()
 	c.Processor.processWorkloadResponse(rspDelta, c.Rbac)
 
 	if err = c.Stream.Send(c.Processor.ack); err != nil {
